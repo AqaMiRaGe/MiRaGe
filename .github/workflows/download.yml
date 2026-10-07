@@ -1,0 +1,47 @@
+name: download
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        required: true
+      url:
+        required: true
+      mode:
+        default: video
+
+jobs:
+  dl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          pip install -U yt-dlp
+
+      - name: Download and send
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          URL: ${{ inputs.url }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "$URL" in http*) ;; *) exit 1 ;; esac
+          mkdir out && cd out
+          if [ "$MODE" = "audio" ]; then
+            yt-dlp -x --audio-format mp3 --audio-quality 0 --max-filesize 49M \
+              -o "%(title).80s.%(ext)s" "$URL" || true
+          else
+            yt-dlp -S "res:720,ext:mp4:m4a" --merge-output-format mp4 --max-filesize 49M \
+              -o "%(title).80s.%(ext)s" "$URL" || true
+          fi
+          f=$(ls | head -n1)
+          API="https://api.telegram.org/bot$BOT_TOKEN"
+          if [ -z "$f" ]; then
+            curl -s "$API/sendMessage" -d chat_id="$CHAT_ID" \
+              -d text="❌ نتونستم دانلود کنم (لینک خصوصیه، حجمش بیشتر از ۵۰ مگه، یا سایت بلاکم کرده)"
+          elif [ "$MODE" = "audio" ]; then
+            curl -s "$API/sendAudio" -F chat_id="$CHAT_ID" -F audio=@"$f"
+          else
+            curl -s "$API/sendVideo" -F chat_id="$CHAT_ID" -F video=@"$f" -F supports_streaming=true
+          fi
