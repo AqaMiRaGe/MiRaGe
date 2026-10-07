@@ -28,10 +28,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/setup-python@v5
+        if: ${{ inputs.mode == 'identify' }}
         with:
           python-version: "3.12"
 
       - uses: denoland/setup-deno@v2
+        if: ${{ contains(inputs.url, 'youtu') || startsWith(inputs.url, 'ytsearch') || inputs.mode == 'identify' }}
         with:
           deno-version: v2.x
 
@@ -39,11 +41,17 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
         run: |
-          (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg) > /dev/null 2>&1 &
-          EXTRA=""
-          if [ "$MODE" = "identify" ]; then EXTRA="shazamio"; fi
-          pip install -q -U "yt-dlp[default]" $EXTRA
-          wait
+          mkdir -p "$HOME/bin"
+          curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o "$HOME/bin/yt-dlp"
+          chmod +x "$HOME/bin/yt-dlp"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          if [ "$MODE" != "search" ] && [ "$MODE" != "shorts" ] && ! command -v ffmpeg > /dev/null 2>&1; then
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null 2>&1 || \
+              (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null 2>&1)
+          fi
+          if [ "$MODE" = "identify" ]; then
+            pip install -q shazamio
+          fi
 
       - name: Run
         env:
@@ -79,4 +87,118 @@ jobs:
           send_files() {
             ls | head -n 5 | while read -r f; do
               if [ "$(stat -c%s "$f")" -gt 52428800 ]; then
-                say
+                say "⚠️ حجم فایل بیشتر از ۵۰ مگه و تلگرام اجازه نمیده 😕"
+                continue
+              fi
+              if [ "$1" = "audio" ]; then
+                curl -s "$API/sendAudio" -F "chat_id=$CHAT_ID" -F "audio=@$f" \
+                  --form-string "title=${f%.*}" "${RT[@]}" > /dev/null < /dev/null
+              else
+                res=$(curl -s "$API/sendVideo" -F "chat_id=$CHAT_ID" -F "video=@$f" \
+                  -F supports_streaming=true "${RT[@]}" < /dev/null)
+                echo "$res" | grep -q '"ok":true' || curl -s "$API/sendDocument" \
+                  -F "chat_id=$CHAT_ID" -F "document=@$f" "${RT[@]}" > /dev/null < /dev/null
+              fi
+            done
+          }
+
+          get_tg_file() {
+            P=$(curl -s "$API/getFile" --data-urlencode "file_id=$FILE_ID" | jq -r '.result.file_path // empty')
+            if [ -z "$P" ]; then
+              say "😕 این فایل بیشتر از ۲۰ مگه و تلگرام اجازه‌ی خوندنش رو به ربات نمیده"
+              exit 0
+            fi
+            curl -s -o in.bin "https://api.telegram.org/file/bot$BOT_TOKEN/$P"
+          }
+
+          cat > "$W/rec.py" <<'PY'
+          import asyncio, json, sys
+          from shazamio import Shazam
+
+          async def main():
+              try:
+                  out = await Shazam().recognize(sys.argv[1])
+                  t = out.get("track")
+                  if t:
+                      print(json.dumps({"title": t.get("title", ""), "artist": t.get("subtitle", "")}, ensure_ascii=False))
+                      return
+              except Exception as e:
+                  print(e, file=sys.stderr)
+              print("{}")
+
+          asyncio.run(main())
+          PY
+
+          case "$MODE" in
+            search|shorts)
+              mkdir -p "$W/a" && cd "$W/a"
+              if [ "$MODE" = "shorts" ]; then
+                yt-dlp "ytsearch30:$QUERY #shorts" --flat-playlist \
+                  --print $'%(id)s\t%(title).55s\t%(duration)s' > raw.txt 2>/dev/null || true
+                awk -F'\t' '$3 ~ /^[0-9.]+$/ && $3 <= 75 {printf "%s\t%s\t%d:%02d\n", $1, $2, int($3/60), int($3)%60}' raw.txt | head -n 8 > res.txt
+                if [ ! -s res.txt ]; then head -n 8 raw.txt > res.txt; fi
+              else
+                yt-dlp "ytsearch8:$QUERY" --flat-playlist \
+                  --print $'%(id)s\t%(title).55s\t%(duration_string)s' > res.txt 2>/dev/null || true
+              fi
+              if [ ! -s res.txt ]; then say "😕 چیزی پیدا نکردم. یه اسم دیگه امتحان کن"; exit 0; fi
+              KB=$(jq -Rn '[inputs | split("\t") | select(length >= 2) | [{text: ("▶️ " + .[1] + (if (.[2] // "") != "" and .[2] != "NA" then " (" + .[2] + ")" else "" end)), callback_data: ("dl:" + .[0])}]]' < res.txt)
+              TXT=$'🎬 نتایج «'"$QUERY"$'»\nروی هر کدوم بزنی، می‌فرستمش 👇'
+              BODY=$(jq -n --argjson c "$CHAT_ID" --arg t "$TXT" --argjson k "$KB" '{chat_id:$c, text:$t, reply_markup:{inline_keyboard:$k}}')
+              curl -s "$API/sendMessage" -H "Content-Type: application/json" -d "$BODY" > /dev/null
+              ;;
+
+            identify)
+              mkdir -p "$W/a" && cd "$W/a"
+              if [ -n "$FILE_ID" ]; then
+                get_tg_file
+                SRC=in.bin
+              else
+                case "$URL" in http://*|https://*) ;; *) exit 1 ;; esac
+                dl_audio "$URL"
+                SRC=$(ls | head -n1)
+              fi
+              if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then say "😕 نتونستم کلیپ رو بگیرم"; exit 0; fi
+              ffmpeg -y -loglevel error -i "$SRC" -t 25 -vn -ac 1 -ar 44100 "$W/sample.wav" || true
+              RES=$(python3 "$W/rec.py" "$W/sample.wav" 2>/dev/null || echo "{}")
+              TITLE=$(echo "$RES" | jq -r '.title // empty')
+              ARTIST=$(echo "$RES" | jq -r '.artist // empty')
+              if [ -z "$TITLE" ]; then
+                say $'🤷 نتونستم آهنگ رو تشخیص بدم\nشاید صدای آهنگ تو کلیپ کمه یا روش صحبت شده'
+                exit 0
+              fi
+              say $'🎵 پیداش کردم!\n\n🎤 '"$ARTIST"$'\n🎶 '"$TITLE"$'\n\n⏳ دارم آهنگ رو هم برات میفرستم...'
+              mkdir -p "$W/song" && cd "$W/song"
+              dl_audio "ytsearch1:$ARTIST - $TITLE"
+              if [ -z "$(ls -A)" ]; then say "😕 اسمش رو پیدا کردم ولی نتونستم فایلش رو بگیرم"; exit 0; fi
+              send_files audio
+              ;;
+
+            audio)
+              mkdir -p "$W/a" && cd "$W/a"
+              if [ -n "$FILE_ID" ]; then
+                get_tg_file
+                ffmpeg -y -loglevel error -i in.bin -vn -codec:a libmp3lame -q:a 3 -t 600 audio.mp3 || true
+                rm -f in.bin
+              else
+                case "$URL" in http://*|https://*|ytsearch1:*) ;; *) exit 1 ;; esac
+                dl_audio "$URL"
+              fi
+              if [ -z "$(ls -A)" ]; then
+                say $'❌ نتونستم بگیرمش\nشاید لینک خصوصیه یا سایت جلوی سرور رو گرفته 😕'
+                exit 0
+              fi
+              send_files audio
+              ;;
+
+            video)
+              case "$URL" in http://*|https://*) ;; *) exit 1 ;; esac
+              mkdir -p "$W/a" && cd "$W/a"
+              dl_video "$URL"
+              if [ -z "$(ls -A)" ]; then
+                say $'❌ نتونستم دانلود کنم\nشاید لینک خصوصیه، حجمش بیشتر از ۵۰ مگه، یا سایت جلوی سرور رو گرفته (مخصوصاً یوتیوب و اینستا) 😕'
+                exit 0
+              fi
+              send_files video
+              ;;
+          esac
